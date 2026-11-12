@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """Predict Roblox's Up-and-Coming top 10 (make.fun: roblox-up-and-coming-forecast-01).
 
-Model: latent log-rank Monte Carlo.
+Model summary: a latent log-rank Monte Carlo forecaster. Each game carries
+a latent strength, the log of its rank, and that strength is simulated
+forward hour by hour over the scored window. The motion has three parts:
+a drift, which is each game's own recent momentum shrunk toward a
+lifecycle prior (young games climb, old games fade); diffusion, a
+per-rank-bin random walk fitted from the history and widened so the
+simulation is not overconfident; and occasional breakout jumps, drawn
+from the empirical jump sizes. Games also age out of the chart, under
+the 28-day rule or an empirical exit hazard, and brand-new games enter
+at the fitted entry rate and entry-rank distribution. The forecast for
+a place is the time-averaged share of simulations in which each game
+holds that place -- the honest marginal the log score rewards -- with
+a small floor for games the simulation rarely puts there and an unnamed
+share left for entrants the history has never seen. The top 10 is the
+per-place argmax, taken greedily so every game appears at most once.
+
   * Every game on the chart has a latent strength x = log(rank). Each hour it
     moves by a drift plus diffusion plus occasional breakout jumps. The drift
     is the game's own momentum -- its log-rank trend over the last 72h (or
@@ -54,34 +69,49 @@ N_SIMS = int(os.environ.get("MAKEFUN_SIMS", "2000"))
 SEED = 20261112
 
 # --- model constants (fitted from the history, then calibrated by backtest) --
-# SIGMA_SCALE: the fitted per-hour diffusion (~0.09 in d log rank) is
+# DIFFUSION_SCALE: the fitted per-hour diffusion (~0.09 in d log rank) is
 # multiplied by 5. The raw simulation is far too confident: the chart churns
 # much faster than a latent random walk with the fitted diffusion implies
 # (the top 10 changes in 42 of 44 read pairs, median 6 places), and the
 # backtests improve monotonically from 1x to ~5x, then flatten (5x: -36.99,
 # 6x: -36.82 on four cutoffs, vs -43.65 at 1x). 5x is the conservative pick
 # on that plateau.
-SIGMA_SCALE = 5.0
+DIFFUSION_SCALE = 5.0
+SIGMA_SCALE = DIFFUSION_SCALE  # legacy alias, same value
 JUMP_SCALE = 1.0        # breakout-jump rate, as fitted (higher rates hurt)
-DRIFT_SHRINK = 3.0      # momentum shrinkage (see below)
+DRIFT_SHRINKAGE = 3.0   # momentum shrinkage (see below)
+DRIFT_SHRINK = DRIFT_SHRINKAGE  # legacy alias, same value
 DRIFT_TAU = 0.0         # momentum does not decay within the window
 
 # --- fitted constants (priors; the data-driven fits below refine them) -------
-SIGMA_POOLED = 0.09      # sd of hourly d log(rank), pooled over all pairs
-JUMP_THRESH = 0.35       # |d log rank| / sqrt(h) that counts as a breakout jump
-P_FLOOR = 0.0005         # smallest probability given to a named game
+POOLED_SIGMA = 0.09     # sd of hourly d log(rank), pooled over all pairs
+SIGMA_POOLED = POOLED_SIGMA  # legacy alias, same value
+BREAKOUT_THRESH = 0.35  # |d log rank| / sqrt(h) that counts as a breakout jump
+JUMP_THRESH = BREAKOUT_THRESH  # legacy alias, same value
+NAMED_P_FLOOR = 0.0005  # smallest probability given to a named game
+P_FLOOR = NAMED_P_FLOOR  # legacy alias, same value
 UNNAMED_MIN = 0.01       # smallest unnamed share per place
 UNNAMED_MAX = 0.08       # largest unnamed share per place
 
 
 def parse_time(s):
+    """Parse an ISO 8601 timestamp, accepting a trailing Z for UTC.
+
+    Returns a timezone-aware datetime, so time differences between
+    reads and the scored window are computed in hours correctly.
+    """
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
 def age_prior_per_hour(age_hours):
-    """Lifecycle drift prior (per hour, in d log rank): young games climb,
-    old games fade. Fitted from the archive: <24h -0.0078, 24-72h -0.0018,
-    72-168h +0.0042, >168h +0.0044."""
+    """Return the lifecycle drift prior for a game of this age.
+
+    The prior is a per-hour change in log rank: young games climb
+    (negative drift, rank number falls), old games fade (positive
+    drift). It is the shrinkage target for each game's own momentum.
+    Fitted from the archive: <24h -0.0078, 24-72h -0.0018,
+    72-168h +0.0042, >168h +0.0044.
+    """
     if age_hours < 24:
         return -0.0078
     if age_hours < 72:
@@ -89,18 +119,24 @@ def age_prior_per_hour(age_hours):
     return 0.0043
 
 
-def rank_bin(r):
-    if r <= 1:
+def rank_bin(rank_value):
+    """Map a rank to its volatility / hazard bin.
+
+    Bins are coarse so each one has enough read pairs to fit a
+    diffusion and an exit hazard from: the top rank alone, then
+    2-3, 4-5, 6-10, 11-20, 21-50, and 51 and below.
+    """
+    if rank_value <= 1:
         return "1"
-    if r <= 3:
+    if rank_value <= 3:
         return "2-3"
-    if r <= 5:
+    if rank_value <= 5:
         return "4-5"
-    if r <= 10:
+    if rank_value <= 10:
         return "6-10"
-    if r <= 20:
+    if rank_value <= 20:
         return "11-20"
-    if r <= 50:
+    if rank_value <= 50:
         return "21-50"
     return "51+"
 
@@ -178,10 +214,12 @@ def main():
     chart = sorted(last["up_and_coming"], key=lambda g: g["rank"])
 
     # ---- fit the dynamics from consecutive read pairs ----------------------
-    # pooled sigma per rank bin (shrunk toward pooled), jump events, exit
-    # hazards per rank bin, entry rate and entry-rank distribution.
-    sig_num = {}   # bin -> sum of (dlogr^2 / dt)
-    sig_den = {}   # bin -> count
+    # Fit the diffusion, the breakout jumps, the exit hazards and the
+    # entry rate from consecutive reads: pooled sigma per rank bin
+    # (shrunk toward pooled), jump events, exit hazards per rank bin,
+    # entry rate and entry-rank distribution.
+    sigma_numerator = {}   # bin -> sum of (dlogr^2 / dt)
+    sigma_denominator = {}   # bin -> count
     jump_up = []   # d log rank values of big upward jumps (negative)
     jump_down = []  # big downward jumps (positive)
     n_pairs = 0
@@ -205,12 +243,14 @@ def main():
                 exits[b] = exits.get(b, 0) + 1
                 continue
             dl = math.log(cur[uid]) - math.log(r0)
-            sig_num[b] = sig_num.get(b, 0.0) + dl * dl / dt_h
-            sig_den[b] = sig_den.get(b, 0) + 1
+            sigma_numerator[b] = sigma_numerator.get(b, 0.0) + dl * dl / dt_h
+            sigma_denominator[b] = sigma_denominator.get(b, 0) + 1
             z = dl / math.sqrt(dt_h)
-            if z < -JUMP_THRESH:
+            # A breakout jump is a move far larger than diffusion alone
+            # would explain in that interval; upward jumps dominate.
+            if z < -BREAKOUT_THRESH:
                 jump_up.append(dl)
-            elif z > JUMP_THRESH:
+            elif z > BREAKOUT_THRESH:
                 jump_down.append(dl)
         for uid, r1 in cur.items():
             if uid not in prev:
@@ -219,19 +259,21 @@ def main():
     total_h = (times[-1] - times[0]).total_seconds() / 3600.0
     entry_rate = entries / total_h if total_h > 0 else 0.5
 
-    pooled_var = sum(sig_num.values()) / max(sum(sig_den.values()), 1)
-    pooled_sigma = math.sqrt(pooled_var) if pooled_var > 0 else SIGMA_POOLED
+    # Diffusion: pool the squared log-rank moves, then shrink each bin
+    # toward the pooled value and widen everything by DIFFUSION_SCALE.
+    pooled_variance = sum(sigma_numerator.values()) / max(sum(sigma_denominator.values()), 1)
+    pooled_sigma = math.sqrt(pooled_variance) if pooled_variance > 0 else POOLED_SIGMA
     sigma_by_bin = {}
     for b in ("1", "2-3", "4-5", "6-10", "11-20", "21-50", "51+"):
-        n = sig_den.get(b, 0)
+        n = sigma_denominator.get(b, 0)
         if n >= 10:
             # shrink the bin estimate toward the pooled value
             w = n / (n + 30.0)
-            sigma_by_bin[b] = math.sqrt(w * sig_num[b] / n + (1 - w) * pooled_var)
+            sigma_by_bin[b] = math.sqrt(w * sigma_numerator[b] / n + (1 - w) * pooled_variance)
         else:
             sigma_by_bin[b] = pooled_sigma
-        sigma_by_bin[b] *= SIGMA_SCALE
-    pooled_sigma *= SIGMA_SCALE
+        sigma_by_bin[b] *= DIFFUSION_SCALE
+    pooled_sigma *= DIFFUSION_SCALE
     # jump rates per game-hour (events are rare; shrink toward a small floor)
     lam_up = len(jump_up) / game_hours if game_hours else 0.001
     lam_down = len(jump_down) / game_hours if game_hours else 0.0002
@@ -360,26 +402,34 @@ def main():
                         c[g["uid"]] = c.get(g["uid"], 0) + 1
 
     # ---- convert counts to probabilities ------------------------------------
+    # Turn simulation counts into honest per-place probabilities: each
+    # game's share of the (simulation, hour) samples at that place.
     # Games the simulation never puts at a place still get a small floor;
     # what is left unnamed covers brand-new entrants.
     probabilities = []
     for k in range(1, places + 1):
-        c = counts[k]
+        place_counts = counts[k]
         tot = total_samples if total_samples > 0 else 1
-        tail_share = tail[k] / tot if tot else 0.0
-        unnamed = min(max(tail_share, UNNAMED_MIN), UNNAMED_MAX)
-        named = []
-        for uid, n in c.items():
+        # Entrant share at this place: the fraction of samples where a
+        # brand-new game held it. Clamp the unnamed share to [1%, 8%]
+        # so a noisy tail cannot swallow the whole place, or vanish.
+        entrant_share = tail[k] / tot if tot else 0.0
+        unnamed = min(max(entrant_share, UNNAMED_MIN), UNNAMED_MAX)
+        named_entries = []
+        for uid, n in place_counts.items():
             p = n / tot
-            if p >= P_FLOOR:
-                named.append([uid, max(p, P_FLOOR)])
-        named.sort(key=lambda z: (-z[1], z[0]))
-        named = named[:100]
-        s = sum(p for _, p in named)
+            # Per-place floor: a game the simulation puts at this place
+            # at least once, even rarely, is named with at least this p,
+            # instead of being left to the unnamed share.
+            if p >= NAMED_P_FLOOR:
+                named_entries.append([uid, max(p, NAMED_P_FLOOR)])
+        named_entries.sort(key=lambda z: (-z[1], z[0]))
+        named_entries = named_entries[:100]
+        s = sum(p for _, p in named_entries)
         if s > 0:
             scale = (1.0 - unnamed) / s
-            named = [[uid, p * scale] for uid, p in named]
-        for uid, p in named:
+            named_entries = [[uid, p * scale] for uid, p in named_entries]
+        for uid, p in named_entries:
             probabilities.append({"universe_id": uid, "place": k,
                                   "p": round(p, 6)})
     # per-place sums must stay <= 1 after rounding
