@@ -63,6 +63,30 @@ import os
 import random
 from datetime import datetime
 
+# Model notes: what the fitted quantities mean, in plain words.
+# Drift is a game's own recent momentum: how fast its log rank has
+# been falling (climbing the chart) or rising (fading) over the last
+# 72 hours, shrunk toward the lifecycle prior for its age. A young
+# game is expected to climb; an old game is expected to fade.
+# Diffusion is the random walk in log rank: how much a game's rank
+# jitters from one read to the next, fitted per rank bin. It is
+# widened by DIFFUSION_SCALE (x5) because the raw fitted walk is
+# far too confident: the chart churns much faster than the walk
+# alone implies, and backtests improve up to about 5x.
+# Breakout jumps are the rare, large moves: about 1% of read pairs
+# move by more than 0.35 in log rank per sqrt(hour), mostly upward,
+# and a good share of them land in the top 10. They are modelled
+# as a Poisson process with the fitted rate and empirical sizes.
+# Aging shapes the chart from both ends. A game leaves the chart
+# when it is 28 days old, if its creation date is known, or at
+# an empirical exit hazard that grows with rank. New games enter
+# at the fitted entry rate, about 0.56 an hour, at entry ranks
+# drawn from the history, so the chart stays populated.
+# The per-place floor names a game the simulation puts at a place
+# even rarely, instead of leaving it to the unnamed share. The
+# unnamed share is what is left for entrants the history has
+# never seen, clamped to 1-8% per place.
+
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 N_SIMS = int(os.environ.get("MAKEFUN_SIMS", "2000"))
@@ -170,6 +194,14 @@ def validate_forecast(probabilities, top10):
 
 
 def main():
+    """Run the forecaster: read the task and the history, fit the
+    dynamics from consecutive reads, simulate the chart forward,
+    aggregate the per-place marginals, validate the forecast,
+    and write forecast.json.
+    The scored window is read from task.json, never hardcoded.
+    The program is deterministic: a fixed seed means two runs on
+    the same input write identical bytes.
+    """
     with open(os.path.join(INPUT_DIR, "task.json")) as f:
         task = json.load(f)
     places = int(task.get("places", 10))
@@ -178,6 +210,10 @@ def main():
     w_from = parse_time(window["from"])
     w_until = parse_time(window["until"])
 
+    # Load the history: one JSON object per line, one per read of
+    # the chart, oldest first. Each line carries the up-and-coming
+    # chart in order, plus the trending and playing charts and the
+    # games' details where the recorder supplied them.
     rows = []
     with open(os.path.join(INPUT_DIR, "history.ndjson")) as f:
         for line in f:
@@ -311,13 +347,19 @@ def main():
         if span_h <= 0:
             drift[uid] = None
             continue
-        mom = (math.log(pts[-1][1]) - math.log(pts[j0][1])) / span_h
-        n_eff = min(len(pts) - 1 - j0, 8)
-        w_mom = n_eff / (n_eff + DRIFT_SHRINK)
+        momentum = (math.log(pts[-1][1]) - math.log(pts[j0][1])) / span_h
+        effective_pair_count = min(len(pts) - 1 - j0, 8)
+        w_mom = effective_pair_count / (effective_pair_count + DRIFT_SHRINK)
         age_h = (last_t - first_seen[uid]).total_seconds() / 3600.0
-        drift[uid] = w_mom * mom + (1 - w_mom) * age_prior_per_hour(age_h)
+        drift[uid] = w_mom * momentum + (1 - w_mom) * age_prior_per_hour(age_h)
 
     # ---- simulate ------------------------------------------------------------
+    # Simulate the chart forward, hour by hour, N_SIMS times.
+    # Each game moves by its drift plus diffusion plus occasional
+    # breakout jumps, ages out, and new entrants arrive, exactly
+    # as fitted above. Only hours inside the scored window are
+    # counted toward the forecast; earlier hours just let the
+    # simulation settle from the last read.
     rng = random.Random(SEED)
     n_hours_total = int(round((w_until - last_t).total_seconds() / 3600.0))
     if n_hours_total <= 0:
@@ -346,13 +388,16 @@ def main():
             "entrant": False,
         })
 
-    for _sim in range(N_SIMS):
+    for simulation_index in range(N_SIMS):
         # fresh copy of the state (dicts are small; copy per sim)
         games = [dict(g) for g in base_games]
         t = last_t
         for h in range(1, n_hours_total + 1):
             t = last_t.timestamp() + h * 3600.0
             # move each game (momentum drift decays toward the age prior)
+            # DRIFT_TAU is 0, so decay is always 1: momentum never
+            # decays toward the age prior inside the window, because
+            # backtests showed decay hurts.
             decay = math.exp(-h / DRIFT_TAU) if DRIFT_TAU > 0 else 1.0
             for g in games:
                 g["x"] += (g["mu_base"] + (g["mu"] - g["mu_base"]) * decay
@@ -362,7 +407,9 @@ def main():
                     g["x"] += rng.choice(jump_up) if jump_up else -0.6
                 elif u < lam_up + lam_down:
                     g["x"] += rng.choice(jump_down) if jump_down else 0.6
-            # age out: 28-day rule when created is known
+            # Age out: drop games older than 28 days when a creation
+            # date is known, so the chart keeps turning over as
+            # games age out of the up-and-coming window.
             games = [g for g in games
                      if g["created"] is None
                      or (t - g["created"].timestamp()) < 28 * 86400]
@@ -446,18 +493,22 @@ def main():
             s = sum(r["p"] for r in rows_k)
 
     # ---- top10: per-place argmax, distinct ----------------------------------
+    # Pick the top 10 in order by taking, place by place, the game
+    # with the highest simulated marginal at that place, skipping
+    # games already picked. This maximises the expected top-10
+    # agreement tie-break. It does not change the log score.
     # marginal probability of each game at each place (from the sim counts)
-    marg = {}
+    marginals = {}
     tot = total_samples if total_samples > 0 else 1
     for k in range(1, places + 1):
         for uid, n in counts[k].items():
-            marg[(uid, k)] = n / tot
+            marginals[(uid, k)] = n / tot
     used = set()
     top10 = []
     for k in range(1, places + 1):
         best = None
         best_p = -1.0
-        for (uid, kk), p in marg.items():
+        for (uid, kk), p in marginals.items():
             if kk == k and uid not in used and p > best_p:
                 best, best_p = uid, p
         if best is None:
@@ -475,6 +526,8 @@ def main():
                 top10.append(g["universe_id"])
                 break
 
+    # Sort deterministically by place, then probability, then id,
+    # so the written file is identical on every run.
     probabilities.sort(key=lambda r: (r["place"], -r["p"], r["universe_id"]))
     validate_forecast(probabilities, top10)
     out = {"probabilities": probabilities, "top10": top10}
